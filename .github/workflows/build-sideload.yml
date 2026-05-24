@@ -40,11 +40,13 @@ jobs:
   build:
     name: Build Files (Sideload)
     runs-on: windows-2025-vs2026
+
     strategy:
       fail-fast: false
       matrix:
         configuration: [Release]
         platform: [x64]
+
     env:
       SOLUTION_NAME: 'Files.slnx'
       CONFIGURATION: '${{ matrix.configuration }}'
@@ -75,18 +77,16 @@ jobs:
         global-json-file: global.json
 
     - name: Create artifacts directory
+      shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path $env:ARTIFACTS_DIR | Out-Null
         New-Item -ItemType Directory -Force -Path $env:APPX_PACKAGE_DIR | Out-Null
-      shell: pwsh
 
     - name: Configure package manifest for sideload
       shell: pwsh
       run: |
-        # Read the manifest
         [xml]$manifest = Get-Content $env:PACKAGE_MANIFEST_PATH
-        
-        # Ensure it's configured for sideload (UapAppxPackageBuildMode will be set by build)
+
         Write-Host "Manifest configured for sideload build"
         Write-Host "Package Identity: $($manifest.Package.Identity.Name)"
 
@@ -94,29 +94,43 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Generating self-signed certificate for signing..."
-        
-        # Create certificate
+
+        # Create certificate with proper MSIX signing configuration
         $cert = New-SelfSignedCertificate `
           -Type CodeSigningCert `
           -Subject "$env:CERT_SUBJECT" `
           -CertStoreLocation "Cert:\CurrentUser\My" `
-          -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3") `
+          -TextExtension @(
+            "2.5.29.37={text}1.3.6.1.5.5.7.3.3",
+            "2.5.29.19={text}CA=0&pathlength=0"
+          ) `
           -KeyExportPolicy Exportable `
-          -NotAfter (Get-Date).AddYears(10)
-        
+          -NotAfter (Get-Date).AddYears(10) `
+          -KeyLength 2048 `
+          -KeyAlgorithm RSA
+
         Write-Host "Certificate created: $($cert.Thumbprint)"
-        
+
         # Export to PFX
         $certPassword = ConvertTo-SecureString -String $env:CERT_PASSWORD -Force -AsPlainText
         $certPath = Join-Path $env:ARTIFACTS_DIR "FilesSideload.pfx"
-        
+
         Export-PfxCertificate `
           -Cert $cert `
           -FilePath $certPath `
           -Password $certPassword | Out-Null
-        
+
         Write-Host "Certificate exported to: $certPath"
-        
+
+        # Verify exported certificate
+        $imported = Get-PfxCertificate -FilePath $certPath
+        Write-Host "Imported cert subject: $($imported.Subject)"
+        Write-Host "Imported cert thumbprint: $($imported.Thumbprint)"
+        Write-Host "Imported cert EKUs:"
+        $imported.EnhancedKeyUsageList | ForEach-Object {
+          Write-Host " - $($_.FriendlyName)"
+        }
+
         # Set output variable
         "CERT_PATH=$certPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -124,6 +138,7 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Restoring NuGet packages..."
+
         msbuild $env:SOLUTION_NAME `
           -t:Restore `
           -p:Platform=$env:PLATFORM `
@@ -134,6 +149,7 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Restoring launcher NuGet packages..."
+
         nuget restore "$env:LAUNCHER_PROJECT_PATH" `
           -SolutionDirectory "$env:WORKING_DIR" `
           -Verbosity quiet
@@ -142,6 +158,7 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building launcher project..."
+
         msbuild "$env:LAUNCHER_PROJECT_PATH" `
           -t:Build `
           -p:Platform=$env:PLATFORM `
@@ -152,6 +169,7 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building Files app..."
+
         msbuild "$env:APP_PROJECT_PATH" `
           -t:Build `
           -p:Platform=$env:PLATFORM `
@@ -166,20 +184,29 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Build artifacts:"
-        Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Recurse -Include "*.msix", "*.msixbundle" | ForEach-Object {
-          Write-Host "  - $($_.FullName)"
-        }
+
+        Get-ChildItem `
+          -Path $env:APPX_PACKAGE_DIR `
+          -Recurse `
+          -Include "*.msix", "*.msixbundle" | ForEach-Object {
+            Write-Host "  - $($_.FullName)"
+          }
 
     - name: Create MSIX bundle
       shell: pwsh
       run: |
         Write-Host "Creating MSIX bundle..."
-        
-        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Name "*.msix" -ErrorAction SilentlyContinue
-        
+
+        $msixFiles = Get-ChildItem `
+          -Path $env:APPX_PACKAGE_DIR `
+          -Name "*.msix" `
+          -ErrorAction SilentlyContinue
+
         if ($msixFiles.Count -gt 0) {
           Write-Host "Found $($msixFiles.Count) MSIX file(s)"
-          $msixFiles | ForEach-Object { Write-Host "  - $_" }
+          $msixFiles | ForEach-Object {
+            Write-Host "  - $_"
+          }
         }
         else {
           Write-Host "No MSIX files found in $env:APPX_PACKAGE_DIR"
@@ -190,14 +217,22 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Copying artifacts..."
-        
-        # Find all MSIX files and copy to artifacts root
-        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Filter "*.msix" -Recurse -ErrorAction SilentlyContinue
-        
+
+        $msixFiles = Get-ChildItem `
+          -Path $env:APPX_PACKAGE_DIR `
+          -Filter "*.msix" `
+          -Recurse `
+          -ErrorAction SilentlyContinue
+
         if ($msixFiles.Count -gt 0) {
           foreach ($file in $msixFiles) {
             $destPath = Join-Path $env:ARTIFACTS_DIR $file.Name
-            Copy-Item -Path $file.FullName -Destination $destPath -Force
+
+            Copy-Item `
+              -Path $file.FullName `
+              -Destination $destPath `
+              -Force
+
             Write-Host "Copied: $($file.Name)"
           }
         }
@@ -210,14 +245,25 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Signing MSIX packages..."
+
         $certPath = Join-Path $env:ARTIFACTS_DIR "FilesSideload.pfx"
         $password = $env:CERT_PASSWORD
 
-        # locate signtool (try PATH first, then SDK folders)
-        $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+        # Locate signtool
+        $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue |
+          Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+
         if (-not $signtool) {
-          $sdkTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($sdkTool) { $signtool = $sdkTool.FullName }
+          $sdkTool = Get-ChildItem `
+            'C:\Program Files (x86)\Windows Kits' `
+            -Recurse `
+            -Filter signtool.exe `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if ($sdkTool) {
+            $signtool = $sdkTool.FullName
+          }
         }
 
         if (-not $signtool) {
@@ -225,19 +271,55 @@ jobs:
           exit 0
         }
 
-        $msixFiles = Get-ChildItem -Path $env:ARTIFACTS_DIR -Filter *.msix -Recurse -ErrorAction SilentlyContinue
+        Write-Host "Using signtool: $signtool"
+
+        $msixFiles = Get-ChildItem `
+          -Path $env:ARTIFACTS_DIR `
+          -Filter *.msix `
+          -Recurse `
+          -ErrorAction SilentlyContinue
+
         if (-not $msixFiles) {
           Write-Host "No MSIX files found to sign." -ForegroundColor Yellow
           exit 0
         }
 
         foreach ($file in $msixFiles) {
-          Write-Host "Signing $($file.FullName) with $certPath"
-          & "$signtool" sign /fd SHA256 /f "$certPath" /p "$password" /tr "http://timestamp.digicert.com" /td SHA256 "$($file.FullName)"
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Signing: $($file.FullName)"
+          Write-Host "========================================"
+
+          # First attempt with RFC3161 timestamp
+          & "$signtool" sign `
+            /debug `
+            /fd SHA256 `
+            /tr "http://timestamp.digicert.com" `
+            /td SHA256 `
+            /f "$certPath" `
+            /p "$password" `
+            "$($file.FullName)"
+
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "signtool failed for $($file.FullName)" -ForegroundColor Red
-            exit $LASTEXITCODE
+            Write-Host ""
+            Write-Host "Timestamp signing failed, retrying without timestamp..." -ForegroundColor Yellow
+
+            # Retry without timestamp
+            & "$signtool" sign `
+              /debug `
+              /fd SHA256 `
+              /f "$certPath" `
+              /p "$password" `
+              "$($file.FullName)"
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ""
+              Write-Host "signtool failed for $($file.FullName)" -ForegroundColor Red
+              exit $LASTEXITCODE
+            }
           }
+
+          Write-Host "Successfully signed: $($file.Name)" -ForegroundColor Green
         }
 
     - name: Upload artifacts
@@ -256,17 +338,23 @@ jobs:
         Write-Host "Build Completed Successfully!" -ForegroundColor Green
         Write-Host "========================================" -ForegroundColor Green
         Write-Host ""
+
         Write-Host "Files Included:" -ForegroundColor Cyan
         Write-Host "  - Files.msix - The app package" -ForegroundColor Yellow
         Write-Host "  - FilesSideload.pfx - Code signing certificate" -ForegroundColor Yellow
         Write-Host ""
+
         Write-Host "Certificate Password: SideloadCertPassword123" -ForegroundColor Yellow
         Write-Host ""
+
         Write-Host "Installation:" -ForegroundColor Cyan
         Write-Host "  1. Run PowerShell as Administrator" -ForegroundColor Yellow
-        Write-Host "  2. Import cert: Import-PfxCertificate -FilePath FilesSideload.pfx -CertStoreLocation 'Cert:\CurrentUser\Root'" -ForegroundColor Yellow
-        Write-Host "  3. Install app: Add-AppxPackage -Path Files.msix" -ForegroundColor Yellow
+        Write-Host "  2. Import cert:" -ForegroundColor Yellow
+        Write-Host "     Import-PfxCertificate -FilePath FilesSideload.pfx -CertStoreLocation 'Cert:\CurrentUser\Root'" -ForegroundColor Yellow
+        Write-Host "  3. Install app:" -ForegroundColor Yellow
+        Write-Host "     Add-AppxPackage -Path Files.msix" -ForegroundColor Yellow
         Write-Host ""
+
         Write-Host "No paywall needed! 🎉" -ForegroundColor Green
         Write-Host ""
 
@@ -275,6 +363,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: always()
+
     steps:
     - name: Print summary
       run: |
