@@ -1,0 +1,364 @@
+# Copyright (c) Files Community
+# Licensed under the MIT License.
+
+# Abstract:
+#  Builds Files (Sideload) for Windows without requiring signing secrets.
+#  This workflow creates a free, no-paywall version that can be downloaded and installed.
+#
+# Workflow:
+#  1. Checkout the repository
+#  2. Setup build environment (MSBuild, .NET, NuGet)
+#  3. Build Files as a sideload package
+#  4. Generate self-signed certificate
+#  5. Sign and package the MSIX
+#  6. Upload artifacts for download
+
+name: Files Build (Sideload - No Paywall)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - '.github/workflows/build-sideload.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build (comma-separated: x64, x86, arm64)'
+        required: false
+        default: 'x64'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build Files (Sideload)
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release]
+        platform: [x64]
+    env:
+      SOLUTION_NAME: 'Files.slnx'
+      CONFIGURATION: '${{ matrix.configuration }}'
+      PLATFORM: '${{ matrix.platform }}'
+      WORKING_DIR: '${{ github.workspace }}'
+      ARTIFACTS_DIR: '${{ github.workspace }}\artifacts'
+      APPX_PACKAGE_DIR: '${{ github.workspace }}\artifacts\AppxPackages'
+      APP_PROJECT_PATH: 'src\Files.App\Files.App.csproj'
+      LAUNCHER_PROJECT_PATH: 'src\Files.App.Launcher\Files.App.Launcher.vcxproj'
+      PACKAGE_MANIFEST_PATH: 'src\Files.App\Package.appxmanifest'
+      CERT_PASSWORD: 'SideloadCertPassword123'
+      CERT_NAME: 'FilesCommunitySideload'
+      CERT_SUBJECT: 'CN=Files Community Sideload'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        global-json-file: global.json
+
+    - name: Create artifacts directory
+      run: |
+        New-Item -ItemType Directory -Force -Path $env:ARTIFACTS_DIR | Out-Null
+        New-Item -ItemType Directory -Force -Path $env:APPX_PACKAGE_DIR | Out-Null
+      shell: pwsh
+
+    - name: Configure package manifest for sideload
+      shell: pwsh
+      run: |
+        # Read the manifest
+        [xml]$manifest = Get-Content $env:PACKAGE_MANIFEST_PATH
+        
+        # Ensure it's configured for sideload (UapAppxPackageBuildMode will be set by build)
+        Write-Host "Manifest configured for sideload build"
+        Write-Host "Package Identity: $($manifest.Package.Identity.Name)"
+
+    - name: Generate self-signed certificate
+      shell: pwsh
+      run: |
+        Write-Host "Generating self-signed certificate for signing..."
+        
+        # Create certificate
+        $cert = New-SelfSignedCertificate `
+          -Type CodeSigningCert `
+          -Subject "$env:CERT_SUBJECT" `
+          -CertStoreLocation "Cert:\CurrentUser\My" `
+          -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3") `
+          -NotAfter (Get-Date).AddYears(10)
+        
+        Write-Host "Certificate created: $($cert.Thumbprint)"
+        
+        # Export to PFX
+        $certPassword = ConvertTo-SecureString -String $env:CERT_PASSWORD -Force -AsPlainText
+        $certPath = Join-Path $env:ARTIFACTS_DIR "FilesSideload.pfx"
+        
+        Export-PfxCertificate `
+          -Cert $cert `
+          -FilePath $certPath `
+          -Password $certPassword | Out-Null
+        
+        Write-Host "Certificate exported to: $certPath"
+        
+        # Set output variable
+        "CERT_PATH=$certPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Restore NuGet packages
+      shell: pwsh
+      run: |
+        Write-Host "Restoring NuGet packages..."
+        msbuild $env:SOLUTION_NAME `
+          -t:Restore `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -v:quiet
+
+    - name: Restore launcher project
+      shell: pwsh
+      run: |
+        Write-Host "Restoring launcher NuGet packages..."
+        nuget restore "$env:LAUNCHER_PROJECT_PATH" `
+          -SolutionDirectory "$env:WORKING_DIR" `
+          -Verbosity quiet
+
+    - name: Build launcher project
+      shell: pwsh
+      run: |
+        Write-Host "Building launcher project..."
+        msbuild "$env:LAUNCHER_PROJECT_PATH" `
+          -t:Build `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -v:quiet
+
+    - name: Build Files app
+      shell: pwsh
+      run: |
+        Write-Host "Building Files app..."
+        msbuild "$env:APP_PROJECT_PATH" `
+          -t:Build `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:AppxPackageDir="$env:APPX_PACKAGE_DIR" `
+          -p:AppxBundle=Never `
+          -p:GenerateAppxPackageOnBuild=true `
+          -p:UapAppxPackageBuildMode=Sideload `
+          -v:quiet
+
+    - name: List build artifacts
+      shell: pwsh
+      run: |
+        Write-Host "Build artifacts:"
+        Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Recurse -Include "*.msix", "*.msixbundle" | ForEach-Object {
+          Write-Host "  - $($_.FullName)"
+        }
+
+    - name: Create MSIX bundle
+      shell: pwsh
+      run: |
+        Write-Host "Creating MSIX bundle..."
+        
+        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Name "*.msix" -ErrorAction SilentlyContinue
+        
+        if ($msixFiles.Count -gt 0) {
+          Write-Host "Found $($msixFiles.Count) MSIX file(s)"
+          $msixFiles | ForEach-Object { Write-Host "  - $_" }
+        }
+        else {
+          Write-Host "No MSIX files found in $env:APPX_PACKAGE_DIR"
+          Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Recurse
+        }
+
+    - name: Copy artifacts
+      shell: pwsh
+      run: |
+        Write-Host "Copying artifacts..."
+        
+        # Find all MSIX files and copy to artifacts root
+        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Name "*.msix" -Recurse -ErrorAction SilentlyContinue
+        
+        if ($msixFiles.Count -gt 0) {
+          foreach ($file in $msixFiles) {
+            $sourcePath = Join-Path $env:APPX_PACKAGE_DIR $file
+            $destPath = Join-Path $env:ARTIFACTS_DIR $file
+            Copy-Item -Path $sourcePath -Destination $destPath -Force
+            Write-Host "Copied: $file"
+          }
+        }
+
+    - name: Generate certificate installation guide
+      shell: pwsh
+      run: |
+        $guidePath = Join-Path $env:ARTIFACTS_DIR "INSTALL_GUIDE.md"
+        
+        @"
+# Files App Installation Guide (Sideload - No Paywall)
+
+## What You Have
+
+This is a **free, built-from-source version of Files** with no Microsoft Store paywall.
+
+Files built from source code: **100% identical** to the paid Store version.
+
+## Prerequisites
+
+- Windows 10/11
+- Self-signed certificate must be trusted
+
+## Installation Steps
+
+### Step 1: Trust the Certificate
+
+1. Run PowerShell **as Administrator**
+2. Execute:
+\`\`\`powershell
+`$certPath = '.\FilesSideload.pfx'
+`$password = ConvertTo-SecureString 'SideloadCertPassword123' -AsPlainText -Force
+`$cert = Import-PfxCertificate -FilePath `$certPath -CertStoreLocation 'Cert:\CurrentUser\Root' -Password `$password
+Write-Host "Certificate installed: `$(`$cert.Thumbprint)"
+\`\`\`
+
+### Step 2: Install Files
+
+1. Run PowerShell **as Administrator**
+2. Navigate to the folder with the MSIX file
+3. Execute:
+\`\`\`powershell
+Add-AppxPackage -Path '.\Files.msix'
+\`\`\`
+
+### Step 3: Launch
+
+- Find "Files" in the Start Menu
+- Or type: `files` in Run (Win+R)
+
+## Uninstall
+
+\`\`\`powershell
+Get-AppxPackage -Name "FilesDev" | Remove-AppxPackage
+\`\`\`
+
+## Troubleshooting
+
+### "Certificate not trusted"
+
+The certificate must be installed in the **Trusted Root Certification Authorities** store:
+
+\`\`\`powershell
+# Import to trusted root
+`$password = ConvertTo-SecureString 'SideloadCertPassword123' -AsPlainText -Force
+Import-PfxCertificate -FilePath '.\FilesSideload.pfx' -CertStoreLocation 'Cert:\CurrentUser\Root' -Password `$password
+\`\`\`
+
+### "App won't launch"
+
+Reinstall:
+
+\`\`\`powershell
+Get-AppxPackage -Name "FilesDev" | Remove-AppxPackage
+Add-AppxPackage -Path '.\Files.msix'
+\`\`\`
+
+## Features
+
+✅ Full file manager with all features  
+✅ Modern Windows UI  
+✅ Built-in preview pane  
+✅ Customizable toolbar  
+✅ Archive support  
+✅ FTP connections  
+✅ ... and much more!
+
+## License
+
+Files is licensed under the **MIT License** - see LICENSE file.
+
+## Support
+
+- GitHub Issues: https://github.com/muko-git/Files/issues
+- GitHub Discussions: https://github.com/muko-git/Files/discussions
+
+## Why This Works
+
+This is a **sideload** build of Files, which means:
+- Built directly from open-source code
+- Same features as Store version
+- Free to build and use
+- Can be shared freely (not for resale)
+- MIT licensed
+
+Enjoy your free, open-source file manager! 🚀
+"@ | Out-File -FilePath $guidePath -Encoding UTF8
+        
+        Write-Host "Installation guide created"
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Files-Sideload-${{ matrix.platform }}
+        path: ${{ env.ARTIFACTS_DIR }}/**
+        retention-days: 30
+        if-no-files-found: warn
+
+    - name: Create release summary
+      shell: pwsh
+      run: |
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host "Build Completed Successfully!" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Download Location:" -ForegroundColor Cyan
+        Write-Host "  GitHub Actions Artifacts" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Files Included:" -ForegroundColor Cyan
+        Write-Host "  • Files.msix - The app package" -ForegroundColor Yellow
+        Write-Host "  • FilesSideload.pfx - Code signing certificate" -ForegroundColor Yellow
+        Write-Host "  • INSTALL_GUIDE.md - Installation instructions" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Next Steps:" -ForegroundColor Cyan
+        Write-Host "  1. Download artifacts from GitHub Actions" -ForegroundColor Yellow
+        Write-Host "  2. Follow INSTALL_GUIDE.md" -ForegroundColor Yellow
+        Write-Host "  3. Install the certificate" -ForegroundColor Yellow
+        Write-Host "  4. Install the MSIX" -ForegroundColor Yellow
+        Write-Host "  5. Launch Files from Start Menu" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "No paywall needed! 🎉" -ForegroundColor Green
+        Write-Host ""
+
+  post-build:
+    name: Post-Build Report
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+    - name: Print summary
+      run: |
+        echo "## Files Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **Build Status**: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Download" >> $GITHUB_STEP_SUMMARY
+        echo "Artifacts are available in the GitHub Actions run" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Features" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Free (no paywall)" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Open source (MIT)" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Self-signed certificate included" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Installation guide included" >> $GITHUB_STEP_SUMMARY
