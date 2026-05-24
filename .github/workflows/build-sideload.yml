@@ -200,6 +200,40 @@ jobs:
             Copy-Item -Path $sourcePath -Destination $destPath -Force
             Write-Host "Copied: $file"
           }
+
+    - name: Sign MSIX packages
+      shell: pwsh
+      run: |
+        Write-Host "Signing MSIX packages..."
+        $certPath = Join-Path $env:ARTIFACTS_DIR "FilesSideload.pfx"
+        $password = $env:CERT_PASSWORD
+
+        # locate signtool (try PATH first, then SDK folders)
+        $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+        if (-not $signtool) {
+          $sdkTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sdkTool) { $signtool = $sdkTool.FullName }
+        }
+
+        if (-not $signtool) {
+          Write-Host "Warning: signtool.exe not found on runner; skipping signing step." -ForegroundColor Yellow
+          exit 0
+        }
+
+        $msixFiles = Get-ChildItem -Path $env:ARTIFACTS_DIR -Filter *.msix -Recurse -ErrorAction SilentlyContinue
+        if (-not $msixFiles) {
+          Write-Host "No MSIX files found to sign." -ForegroundColor Yellow
+          exit 0
+        }
+
+        foreach ($file in $msixFiles) {
+          Write-Host "Signing $($file.FullName) with $certPath"
+          & $signtool sign /fd SHA256 /f $certPath /p $password /tr http://timestamp.digicert.com /td SHA256 $file.FullName
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "signtool failed for $($file.FullName)" -ForegroundColor Red
+            exit $LASTEXITCODE
+          }
+        }
         }
 
     - name: Upload artifacts
