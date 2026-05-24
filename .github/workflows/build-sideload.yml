@@ -200,6 +200,7 @@ jobs:
             Copy-Item -Path $sourcePath -Destination $destPath -Force
             Write-Host "Copied: $file"
           }
+        }
 
     - name: Sign MSIX packages
       shell: pwsh
@@ -233,7 +234,6 @@ jobs:
             Write-Host "signtool failed for $($file.FullName)" -ForegroundColor Red
             exit $LASTEXITCODE
           }
-        }
         }
 
     - name: Upload artifacts
