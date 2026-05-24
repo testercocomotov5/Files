@@ -101,6 +101,7 @@ jobs:
           -Subject "$env:CERT_SUBJECT" `
           -CertStoreLocation "Cert:\CurrentUser\My" `
           -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3") `
+          -KeyExportPolicy Exportable `
           -NotAfter (Get-Date).AddYears(10)
         
         Write-Host "Certificate created: $($cert.Thumbprint)"
@@ -191,15 +192,18 @@ jobs:
         Write-Host "Copying artifacts..."
         
         # Find all MSIX files and copy to artifacts root
-        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Name "*.msix" -Recurse -ErrorAction SilentlyContinue
+        $msixFiles = Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Filter "*.msix" -Recurse -ErrorAction SilentlyContinue
         
         if ($msixFiles.Count -gt 0) {
           foreach ($file in $msixFiles) {
-            $sourcePath = Join-Path $env:APPX_PACKAGE_DIR $file
-            $destPath = Join-Path $env:ARTIFACTS_DIR $file
-            Copy-Item -Path $sourcePath -Destination $destPath -Force
-            Write-Host "Copied: $file"
+            $destPath = Join-Path $env:ARTIFACTS_DIR $file.Name
+            Copy-Item -Path $file.FullName -Destination $destPath -Force
+            Write-Host "Copied: $($file.Name)"
           }
+        }
+        else {
+          Write-Host "No MSIX files found to copy in $env:APPX_PACKAGE_DIR"
+          Get-ChildItem -Path $env:APPX_PACKAGE_DIR -Recurse
         }
 
     - name: Sign MSIX packages
@@ -229,7 +233,7 @@ jobs:
 
         foreach ($file in $msixFiles) {
           Write-Host "Signing $($file.FullName) with $certPath"
-          & $signtool sign /fd SHA256 /f $certPath /p $password /tr http://timestamp.digicert.com /td SHA256 $file.FullName
+          & "$signtool" sign /fd SHA256 /f "$certPath" /p "$password" /tr "http://timestamp.digicert.com" /td SHA256 "$($file.FullName)"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "signtool failed for $($file.FullName)" -ForegroundColor Red
             exit $LASTEXITCODE
